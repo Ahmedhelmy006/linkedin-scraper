@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from services.lookup import LinkedInProfileLookup
+from services.lookup.lookup import LinkedInProfileLookup
 from utils.email_validator import EmailValidator
 
 # Configure logging
