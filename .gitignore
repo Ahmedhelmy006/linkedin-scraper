@@ -67,3 +67,5 @@ htmlcov/
 
 # Distribution / packaging
 .Python
+
+*.html

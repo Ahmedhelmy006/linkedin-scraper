@@ -92,7 +92,7 @@ class PlaywrightDriver:
             # Configure context options
             context_options = {
                 "user_agent": user_agent,
-                "viewport": {'width': 1920, 'height': 1080},
+                "viewport": {'width': 1200, 'height': 900},
                 "locale": "en-US"
             }
             
