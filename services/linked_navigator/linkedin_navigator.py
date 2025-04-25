@@ -1,9 +1,10 @@
 # services/linkedin_navigator.py
 """
-LinkedIn Navigator module for scraping LinkedIn profiles.
+Enhanced LinkedIn Navigator module for scraping LinkedIn profiles.
 
 This module handles LinkedIn navigation and content extraction,
-working with the human-like behavior module to ensure natural interaction.
+working with the human-like behavior module to ensure natural interaction
+while avoiding detection patterns.
 """
 
 import logging
@@ -11,8 +12,9 @@ import re
 import time
 import os
 import json
+import random
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple, Set
 
 from config.scraper_config import PROFILES_DIR
 from utils.playwright_driver import PlaywrightDriver
@@ -25,7 +27,8 @@ class LinkedInNavigator:
     LinkedIn Profile Navigator.
     
     This class handles navigation to LinkedIn profiles and extraction
-    of profile data, following human-like behavior patterns.
+    of profile data, following human-like behavior patterns and avoiding
+    detection through natural timing and navigation patterns.
     """
     
     def __init__(
@@ -64,13 +67,7 @@ class LinkedInNavigator:
         
         # Initialize storage for the extracted HTML
         self.main_profile_html = ""
-        self.experience_html = ""
-        self.education_html = ""
-        self.skills_html = ""
-        self.recommendations_html = ""
-        self.courses_html = ""
-        self.languages_html = ""
-        self.interests_html = ""
+        self.section_html = {}  # Store all section HTML by section name
         
         # Initialize metadata
         self.profile_name = ""
@@ -79,6 +76,10 @@ class LinkedInNavigator:
             "scrape_date": datetime.now().isoformat(),
             "sections_scraped": []
         }
+        
+        # Track sections available in the profile
+        self.available_sections = set()
+        self.section_links = {}  # Store actual URLs for sections
         
         # Initialize other state properties
         self.is_authenticated = False
@@ -100,18 +101,6 @@ class LinkedInNavigator:
         if match:
             return match.group(1)
         return url
-    
-    def _build_section_url(self, section: str) -> str:
-        """
-        Build a URL for a specific profile section.
-        
-        Args:
-            section: The section name (e.g., 'experience', 'education')
-            
-        Returns:
-            Full URL for the specified section
-        """
-        return f"{self.profile_url}/details/{section}/"
     
     def start(self) -> bool:
         """
@@ -172,6 +161,10 @@ class LinkedInNavigator:
             if not self.behavior.browse_feed():
                 logger.warning("Feed browsing failed or was skipped")
             
+            # Occasionally visit a random site before navigating to the profile
+            if random.random() < 0.3:  # 30% chance
+                self.behavior.visit_random_site(duration_range=(30, 90))
+            
             # Navigate to the profile using human-like behavior
             if not self.behavior.navigate_to_profile(self.profile_url):
                 self.last_error = f"Failed to navigate to {self.profile_url}"
@@ -200,6 +193,9 @@ class LinkedInNavigator:
             # Update metadata
             self.metadata["sections_scraped"].append("main_profile")
             
+            # Extract available section links from the main profile
+            self._extract_section_links()
+            
             # Read profile content with human-like behavior
             self.behavior.simulate_reading(min_duration=5.0, max_duration=15.0)
             
@@ -212,278 +208,163 @@ class LinkedInNavigator:
             logger.error(self.last_error, exc_info=True)
             return False
     
-    def navigate_experience(self) -> bool:
+    def _extract_section_links(self) -> None:
+        """Extract all available section links from the main profile HTML."""
+        if not self.driver or not self.main_profile_html:
+            return
+            
+        try:
+            # Use JavaScript to extract section links
+            section_links = self.driver.evaluate("""
+                () => {
+                    const sectionLinks = {};
+                    const commonSections = [
+                        'experience', 'education', 'skills', 'recommendations', 
+                        'courses', 'languages', 'interests', 'certifications', 
+                        'projects', 'publications', 'patents', 'volunteer'
+                    ];
+                    
+                    // Look for explicit section links
+                    document.querySelectorAll('a[href*="/details/"]').forEach(link => {
+                        const href = link.href;
+                        for (const section of commonSections) {
+                            if (href.includes(`/details/${section}`)) {
+                                sectionLinks[section] = href;
+                                break;
+                            }
+                        }
+                    });
+                    
+                    return sectionLinks;
+                }
+            """)
+            
+            if section_links and isinstance(section_links, dict):
+                self.section_links = section_links
+                self.available_sections = set(section_links.keys())
+                logger.info(f"Extracted {len(self.available_sections)} section links: {', '.join(self.available_sections)}")
+            else:
+                logger.warning("No section links found in profile")
+                
+        except Exception as e:
+            logger.error(f"Error extracting section links: {str(e)}")
+    
+    def navigate_section(self, section: str) -> bool:
         """
-        Navigate to the experience section and extract its HTML.
+        Navigate to a specific profile section using extracted links or by name.
         
+        Args:
+            section: Section name (e.g., 'experience', 'education')
+            
         Returns:
             True if successful, False otherwise
         """
         if not self.driver:
-            self.last_error = "Driver not initialized. Call start() first."
+            self.last_error = f"Driver not initialized. Call start() first."
+            logger.error(self.last_error)
+            return False
+            
+        if not self.main_profile_html:
+            self.last_error = f"Main profile not loaded. Call navigate_profile() first."
             logger.error(self.last_error)
             return False
         
         try:
-            # Navigate to the experience section using human-like behavior
-            if not self.behavior.navigate_to_profile_section(self.profile_url, "experience"):
-                self.last_error = "Failed to navigate to experience section"
+            # Check if section is available
+            if section not in self.available_sections and section not in self.section_links:
+                # Section not found in extracted links, check if we should try anyway
+                # For the most common sections, try even if not found in links
+                common_sections = {'experience', 'education', 'skills'}
+                if section not in common_sections:
+                    logger.info(f"Section '{section}' not available in profile, skipping")
+                    return False
+                    
+                logger.warning(f"Section '{section}' not found in extracted links but is common, trying anyway")
+            
+            # Get section URL (either from extracted links or build it)
+            section_url = None
+            if section in self.section_links:
+                section_url = self.section_links[section]
+                logger.info(f"Using extracted section URL: {section_url}")
+            
+            # Navigate to the section
+            success = False
+            if section_url:
+                # Use the exact extracted URL which includes query parameters
+                success = self.behavior.navigate_to_profile_section(self.profile_url, section)
+            else:
+                # Fallback to standard navigation
+                success = self.behavior.navigate_to_profile_section(self.profile_url, section)
+            
+            if not success:
+                self.last_error = f"Failed to navigate to {section} section"
                 logger.error(self.last_error)
                 return False
             
-            # Extract the HTML
-            self.experience_html = self.driver.get_content()
+            # Extract the HTML with variable timeout for randomization
+            random_pause = random.uniform(0.5, 2.0)
+            time.sleep(random_pause)
+            html_content = self.driver.get_content()
             
-            if not self.experience_html:
-                self.last_error = "Failed to extract experience HTML"
+            if not html_content:
+                self.last_error = f"Failed to extract {section} HTML"
                 logger.error(self.last_error)
                 return False
+            
+            # Store the section HTML
+            self.section_html[section] = html_content
             
             # Update metadata
-            self.metadata["sections_scraped"].append("experience")
+            if section not in self.metadata["sections_scraped"]:
+                self.metadata["sections_scraped"].append(section)
             
-            logger.info("Successfully extracted experience section HTML")
-            logger.info(f"Experience HTML length: {len(self.experience_html)}")
+            # Read section content with human-like behavior
+            reading_duration = random.uniform(3.0, 10.0)
+            self.behavior.simulate_reading(min_duration=reading_duration, max_duration=reading_duration * 1.5)
+            
+            logger.info(f"Successfully extracted {section} section HTML")
+            logger.info(f"{section.capitalize()} HTML length: {len(html_content)}")
+            
+            # Navigate back to main profile using back button
+            self.behavior.navigate_back_to_profile()
+            
+            # Variable pause after returning to main profile
+            time.sleep(random.uniform(1.0, 3.5))
+            
             return True
             
         except Exception as e:
-            self.last_error = f"Error navigating experience section: {str(e)}"
+            self.last_error = f"Error navigating {section} section: {str(e)}"
             logger.error(self.last_error, exc_info=True)
             return False
+    
+    def navigate_experience(self) -> bool:
+        """Navigate to the experience section."""
+        return self.navigate_section('experience')
     
     def navigate_education(self) -> bool:
-        """
-        Navigate to the education section and extract its HTML.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.driver:
-            self.last_error = "Driver not initialized. Call start() first."
-            logger.error(self.last_error)
-            return False
-        
-        try:
-            # Navigate to the education section using human-like behavior
-            if not self.behavior.navigate_to_profile_section(self.profile_url, "education"):
-                self.last_error = "Failed to navigate to education section"
-                logger.error(self.last_error)
-                return False
-            
-            # Extract the HTML
-            self.education_html = self.driver.get_content()
-            
-            if not self.education_html:
-                self.last_error = "Failed to extract education HTML"
-                logger.error(self.last_error)
-                return False
-            
-            # Update metadata
-            self.metadata["sections_scraped"].append("education")
-            
-            logger.info("Successfully extracted education section HTML")
-            logger.info(f"Education HTML length: {len(self.education_html)}")
-            return True
-            
-        except Exception as e:
-            self.last_error = f"Error navigating education section: {str(e)}"
-            logger.error(self.last_error, exc_info=True)
-            return False
+        """Navigate to the education section."""
+        return self.navigate_section('education')
     
     def navigate_skills(self) -> bool:
-        """
-        Navigate to the skills section and extract its HTML.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.driver:
-            self.last_error = "Driver not initialized. Call start() first."
-            logger.error(self.last_error)
-            return False
-        
-        try:
-            # Navigate to the skills section using human-like behavior
-            if not self.behavior.navigate_to_profile_section(self.profile_url, "skills"):
-                self.last_error = "Failed to navigate to skills section"
-                logger.error(self.last_error)
-                return False
-            
-            # Extract the HTML
-            self.skills_html = self.driver.get_content()
-            
-            if not self.skills_html:
-                self.last_error = "Failed to extract skills HTML"
-                logger.error(self.last_error)
-                return False
-            
-            # Update metadata
-            self.metadata["sections_scraped"].append("skills")
-            
-            logger.info("Successfully extracted skills section HTML")
-            logger.info(f"Skills HTML length: {len(self.skills_html)}")
-            return True
-            
-        except Exception as e:
-            self.last_error = f"Error navigating skills section: {str(e)}"
-            logger.error(self.last_error, exc_info=True)
-            return False
+        """Navigate to the skills section."""
+        return self.navigate_section('skills')
     
     def navigate_recommendations(self) -> bool:
-        """
-        Navigate to the recommendations section and extract its HTML.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.driver:
-            self.last_error = "Driver not initialized. Call start() first."
-            logger.error(self.last_error)
-            return False
-        
-        try:
-            # Navigate to the recommendations section using human-like behavior
-            if not self.behavior.navigate_to_profile_section(self.profile_url, "recommendations"):
-                self.last_error = "Failed to navigate to recommendations section"
-                logger.error(self.last_error)
-                return False
-            
-            # Extract the HTML
-            self.recommendations_html = self.driver.get_content()
-            
-            if not self.recommendations_html:
-                self.last_error = "Failed to extract recommendations HTML"
-                logger.error(self.last_error)
-                return False
-            
-            # Update metadata
-            self.metadata["sections_scraped"].append("recommendations")
-            
-            logger.info("Successfully extracted recommendations section HTML")
-            logger.info(f"Recommendations HTML length: {len(self.recommendations_html)}")
-            return True
-            
-        except Exception as e:
-            self.last_error = f"Error navigating recommendations section: {str(e)}"
-            logger.error(self.last_error, exc_info=True)
-            return False
+        """Navigate to the recommendations section."""
+        return self.navigate_section('recommendations')
     
     def navigate_courses(self) -> bool:
-        """
-        Navigate to the courses section and extract its HTML.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.driver:
-            self.last_error = "Driver not initialized. Call start() first."
-            logger.error(self.last_error)
-            return False
-        
-        try:
-            # Navigate to the courses section using human-like behavior
-            if not self.behavior.navigate_to_profile_section(self.profile_url, "courses"):
-                self.last_error = "Failed to navigate to courses section"
-                logger.error(self.last_error)
-                return False
-            
-            # Extract the HTML
-            self.courses_html = self.driver.get_content()
-            
-            if not self.courses_html:
-                self.last_error = "Failed to extract courses HTML"
-                logger.error(self.last_error)
-                return False
-            
-            # Update metadata
-            self.metadata["sections_scraped"].append("courses")
-            
-            logger.info("Successfully extracted courses section HTML")
-            logger.info(f"Courses HTML length: {len(self.courses_html)}")
-            return True
-            
-        except Exception as e:
-            self.last_error = f"Error navigating courses section: {str(e)}"
-            logger.error(self.last_error, exc_info=True)
-            return False
+        """Navigate to the courses section."""
+        return self.navigate_section('courses')
     
     def navigate_languages(self) -> bool:
-        """
-        Navigate to the languages section and extract its HTML.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.driver:
-            self.last_error = "Driver not initialized. Call start() first."
-            logger.error(self.last_error)
-            return False
-        
-        try:
-            # Navigate to the languages section using human-like behavior
-            if not self.behavior.navigate_to_profile_section(self.profile_url, "languages"):
-                self.last_error = "Failed to navigate to languages section"
-                logger.error(self.last_error)
-                return False
-            
-            # Extract the HTML
-            self.languages_html = self.driver.get_content()
-            
-            if not self.languages_html:
-                self.last_error = "Failed to extract languages HTML"
-                logger.error(self.last_error)
-                return False
-            
-            # Update metadata
-            self.metadata["sections_scraped"].append("languages")
-            
-            logger.info("Successfully extracted languages section HTML")
-            logger.info(f"Languages HTML length: {len(self.languages_html)}")
-            return True
-            
-        except Exception as e:
-            self.last_error = f"Error navigating languages section: {str(e)}"
-            logger.error(self.last_error, exc_info=True)
-            return False
+        """Navigate to the languages section."""
+        return self.navigate_section('languages')
     
     def navigate_interests(self) -> bool:
-        """
-        Navigate to the interests section and extract its HTML.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.driver:
-            self.last_error = "Driver not initialized. Call start() first."
-            logger.error(self.last_error)
-            return False
-        
-        try:
-            # Navigate to the interests section using human-like behavior
-            if not self.behavior.navigate_to_profile_section(self.profile_url, "interests"):
-                self.last_error = "Failed to navigate to interests section"
-                logger.error(self.last_error)
-                return False
-            
-            # Extract the HTML
-            self.interests_html = self.driver.get_content()
-            
-            if not self.interests_html:
-                self.last_error = "Failed to extract interests HTML"
-                logger.error(self.last_error)
-                return False
-            
-            # Update metadata
-            self.metadata["sections_scraped"].append("interests")
-            
-            logger.info("Successfully extracted interests section HTML")
-            logger.info(f"Interests HTML length: {len(self.interests_html)}")
-            return True
-            
-        except Exception as e:
-            self.last_error = f"Error navigating interests section: {str(e)}"
-            logger.error(self.last_error, exc_info=True)
-            return False
+        """Navigate to the interests section."""
+        return self.navigate_section('interests')
     
     def _extract_profile_name(self) -> None:
         """Extract the profile name from the current page."""
@@ -571,7 +452,7 @@ class LinkedInNavigator:
     
     def scrape_all_sections(self) -> bool:
         """
-        Scrape all available profile sections.
+        Scrape all available profile sections based on detected links.
         
         Returns:
             True if at least some sections were successfully scraped, False otherwise
@@ -582,25 +463,62 @@ class LinkedInNavigator:
         if self.navigate_profile():
             success = True
             
-            # Navigate to other sections
-            sections = [
-                ("experience", self.navigate_experience),
-                ("education", self.navigate_education),
-                ("skills", self.navigate_skills),
-                ("recommendations", self.navigate_recommendations),
-                ("courses", self.navigate_courses),
-                ("languages", self.navigate_languages),
-                ("interests", self.navigate_interests)
-            ]
+            # Get the available sections from the profile
+            available_sections = list(self.available_sections)
             
-            for section_name, section_method in sections:
+            # If no sections were detected, try common ones
+            if not available_sections:
+                logger.warning("No sections detected in profile, trying common sections")
+                available_sections = ['experience', 'education', 'skills']
+            
+            # Shuffle the sections to make the scraping pattern less predictable
+            random.shuffle(available_sections)
+            
+            # Keep track of sections processed
+            sections_processed = 0
+            
+            # Process each section
+            for section in available_sections:
                 try:
-                    logger.info(f"Scraping {section_name} section...")
-                    section_method()
-                    # Short pause between sections to avoid rate limiting
-                    time.sleep(2)
+                    # Occasionally visit a random site between sections (20% chance)
+                    if random.random() < 0.2 and sections_processed > 0:
+                        logger.info("Taking a break by visiting a random site")
+                        self.behavior.visit_random_site(duration_range=(30, 90))
+                        
+                        # Return to profile
+                        if not self.behavior.navigate_to_profile(self.profile_url):
+                            logger.warning("Failed to return to profile after random site visit")
+                            time.sleep(random.uniform(1.5, 3.0))
+                    
+                    logger.info(f"Scraping {section} section...")
+                    
+                    # Add a variable pause between sections
+                    if sections_processed > 0:
+                        time.sleep(random.uniform(1.5, 4.5))
+                    
+                    # Navigate to the section
+                    self.navigate_section(section)
+                    sections_processed += 1
+                    
+                    # Decide if we should continue or stop (to make it more natural)
+                    # As we process more sections, increase the chance of stopping
+                    stop_chance = 0.1 * sections_processed
+                    if random.random() < stop_chance and sections_processed >= 3:
+                        logger.info(f"Naturally stopping after {sections_processed} sections")
+                        break
+                    
                 except Exception as e:
-                    logger.error(f"Error scraping {section_name} section: {str(e)}")
+                    logger.error(f"Error scraping {section} section: {str(e)}")
+                    # Continue with next section
+            
+            # Final reading of the profile
+            if sections_processed > 0:
+                # Return to main profile if we processed any sections
+                if not self.behavior.navigate_to_profile(self.profile_url):
+                    logger.warning("Failed to return to main profile after scraping sections")
+                
+                # Final reading of the profile
+                self.behavior.simulate_reading(min_duration=3.0, max_duration=8.0)
         
         return success
     
@@ -621,30 +539,48 @@ class LinkedInNavigator:
         profile_dir = os.path.join(base_dir, safe_name)
         os.makedirs(profile_dir, exist_ok=True)
         
-        # Update metadata
+        # Update metadata with final information
         self.metadata["save_time"] = datetime.now().isoformat()
+        self.metadata["available_sections"] = list(self.available_sections)
+        self.metadata["sections_scraped"] = self.metadata["sections_scraped"]
+        
+        # Add device and browser information to metadata
+        try:
+            device_info = self.driver.evaluate("""
+                () => {
+                    return {
+                        userAgent: navigator.userAgent,
+                        platform: navigator.platform,
+                        screenWidth: window.screen.width,
+                        screenHeight: window.screen.height,
+                        devicePixelRatio: window.devicePixelRatio,
+                        language: navigator.language,
+                        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+                    };
+                }
+            """)
+            
+            if device_info:
+                self.metadata["device_info"] = device_info
+        except Exception as e:
+            logger.error(f"Error getting device info: {str(e)}")
         
         # Save metadata
         metadata_file = os.path.join(profile_dir, f"{safe_name}_metadata.json")
         with open(metadata_file, 'w', encoding='utf-8') as f:
             json.dump(self.metadata, f, indent=2)
         
-        # Save HTML files
-        html_files = [
-            ("main_profile", self.main_profile_html),
-            ("experience", self.experience_html),
-            ("education", self.education_html),
-            ("skills", self.skills_html),
-            ("recommendations", self.recommendations_html),
-            ("courses", self.courses_html),
-            ("languages", self.languages_html),
-            ("interests", self.interests_html)
-        ]
+        # Save main profile HTML
+        if self.main_profile_html:
+            main_profile_file = os.path.join(profile_dir, "main_profile.html")
+            with open(main_profile_file, 'w', encoding='utf-8') as f:
+                f.write(self.main_profile_html)
         
-        for section_name, html_content in html_files:
+        # Save section HTML files
+        for section_name, html_content in self.section_html.items():
             if html_content:
-                html_file = os.path.join(profile_dir, f"{section_name}.html")
-                with open(html_file, 'w', encoding='utf-8') as f:
+                section_file = os.path.join(profile_dir, f"{section_name}.html")
+                with open(section_file, 'w', encoding='utf-8') as f:
                     f.write(html_content)
         
         logger.info(f"Saved profile data to {profile_dir}")
@@ -658,3 +594,7 @@ class LinkedInNavigator:
                 logger.info("Navigator closed successfully")
             except Exception as e:
                 logger.error(f"Error closing navigator: {str(e)}")
+                
+    def __del__(self):
+        """Destructor to ensure browser is closed."""
+        self.close()

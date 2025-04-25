@@ -1,9 +1,10 @@
-# services/brain.py
+# services/linked_navigator/brain.py
 """
-Brain module for LinkedIn scraper system.
+Enhanced Brain module for LinkedIn scraper system.
 
 The Brain is the central decision-making component that manages scheduling,
 queue prioritization, and session execution based on human-like patterns.
+It now includes improved session management to avoid interrupting profiles.
 """
 
 import json
@@ -32,6 +33,9 @@ class Brain:
     
     Handles scheduling decisions, session management, and coordinates
     the overall scraping process based on human-like behavior patterns.
+    
+    Enhanced with features to avoid interrupting profile scraping operations
+    and to handle session timing more naturally.
     """
     
     def __init__(self, memory_path: str = MEMORY_PATH):
@@ -57,6 +61,11 @@ class Brain:
         # Session planning
         self.next_sessions = []
         self.current_session = None
+        
+        # Profile tracking for session management
+        self.profile_in_progress = False
+        self.should_terminate_session = False
+        self.session_overtime_allowed = 0  # Additional time allowed for completing a profile
         
         # Initialize memory if needed
         if not os.path.exists(memory_path):
@@ -325,7 +334,6 @@ class Brain:
                         self._handle_cooldown_period()
                     elif current_state == STATES["ERROR"]:
                         self._handle_error_state()
-                    # ADD THIS BLOCK HERE
                     elif current_state == STATES["SESSION_STARTING"]:
                         # Check if it's time to start the session
                         state_data = self.state_machine.get_state_data()
@@ -345,6 +353,15 @@ class Brain:
                                     f"Starting session {session_plan['id']}",
                                     {"session_id": session_plan['id']}
                                 )
+                    elif current_state == STATES["FEED_BROWSING"] or current_state == STATES["PROFILE_SCRAPING"]:
+                        # Check if we should end the session due to duration
+                        if self.check_session_duration():
+                            logger.info("Session duration limit reached, transitioning to SESSION_ENDING")
+                            self.state_machine.transition(
+                                STATES["SESSION_ENDING"],
+                                "Session duration limit reached",
+                                {"session_id": self.current_session["id"] if self.current_session else None}
+                            )
                     
                     # Short sleep to prevent CPU hogging
                     time.sleep(1)
@@ -602,6 +619,52 @@ class Brain:
         # Default to first session type if something goes wrong
         return SESSION_TYPES[0]
     
+    def check_session_duration(self) -> bool:
+        """
+        Check if the current session has exceeded its planned duration.
+        
+        Returns:
+            True if the session should terminate after the current profile, False otherwise
+        """
+        if not self.current_session:
+            return False
+            
+        # Get planned and actual durations
+        planned_duration = self.current_session.get("planned_duration", 0)
+        start_time = datetime.fromisoformat(self.current_session["start_time"])
+        actual_duration = (datetime.now() - start_time).total_seconds()
+        
+        # Check if we've exceeded planned duration
+        if actual_duration > planned_duration + self.session_overtime_allowed:
+            if not self.profile_in_progress:
+                # No profile in progress, can terminate immediately
+                logger.info(f"Session duration exceeded ({actual_duration:.1f}s > {planned_duration:.1f}s), terminating")
+                return True
+            elif not self.should_terminate_session:
+                # Profile in progress, mark for termination after completion
+                logger.info(f"Session duration exceeded but profile in progress. Will terminate after completion.")
+                self.should_terminate_session = True
+                # Allow extra time for current profile to complete
+                self.session_overtime_allowed = 300  # 5 minutes grace period
+                return False
+        
+        return self.should_terminate_session and not self.profile_in_progress
+
+    def mark_profile_started(self) -> None:
+        """Mark that a profile scraping operation has started."""
+        self.profile_in_progress = True
+        logger.debug("Profile scraping started")
+
+    def mark_profile_completed(self) -> None:
+        """Mark that a profile scraping operation has completed."""
+        self.profile_in_progress = False
+        logger.debug("Profile scraping completed")
+        
+        # Check if we should terminate the session
+        if self.should_terminate_session:
+            logger.info("Profile completed and session marked for termination. Ending session now.")
+            if self.current_session:
+                self.event_bus.publish(EVENTS["SESSION_ENDED"], self.current_session)
 
     def session_started(self, session_id: str) -> None:
         """
@@ -633,9 +696,13 @@ class Brain:
             "profiles_failed": 0
         }
         
-        # ADD THIS LOG
-        logger.info(f"Publishing SESSION_STARTED event for session {session_id}")
+        # Reset session termination flags
+        self.profile_in_progress = False
+        self.should_terminate_session = False
+        self.session_overtime_allowed = 0
+        
         # Publish event
+        logger.info(f"Publishing SESSION_STARTED event for session {session_id}")
         self.event_bus.publish(EVENTS["SESSION_STARTED"], self.current_session)
         
         logger.info(f"Session {session_id} started")
@@ -684,6 +751,10 @@ class Brain:
         completed_session = self.current_session
         self.current_session = None
         
+        # Reset profile progress tracking
+        self.profile_in_progress = False
+        self.should_terminate_session = False
+        
         logger.info(f"Session {session_id} ended. Scraped {completed_session['profiles_completed']} profiles "
                    f"in {completed_session['actual_duration']/60:.1f} minutes.")
     
@@ -704,5 +775,8 @@ class Brain:
             "special_hours": {
                 "three_session_hour": self.three_session_hour,
                 "one_session_hours": self.one_session_hours
-            }
+            },
+            "profile_in_progress": self.profile_in_progress,
+            "should_terminate_session": self.should_terminate_session,
+            "session_overtime_allowed": self.session_overtime_allowed
         }
