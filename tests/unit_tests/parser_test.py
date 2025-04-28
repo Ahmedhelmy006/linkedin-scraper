@@ -7,6 +7,9 @@ import os
 import sys
 import json
 import logging
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
 
 # Configure logging
 logging.basicConfig(
@@ -16,12 +19,11 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+from services.parser.profile_parser import LinkedInProfileParser
 
 # Add parent directory to path to import our modules
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import the parser modules
-from services.parser.profile_parser import LinkedInProfileParser
 
 
 def test_single_profile(profile_dir):
