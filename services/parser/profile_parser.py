@@ -13,6 +13,8 @@ import re
 from typing import Dict, List, Any, Optional, Tuple
 from bs4 import BeautifulSoup
 from datetime import datetime
+import traceback
+
 
 logger = logging.getLogger(__name__)
 
@@ -160,80 +162,43 @@ class LinkedInProfileParser:
         }
         
         try:
-            # Extract headline
-            headline_selectors = [
-                'h2.text-heading-large',
-                '.pv-text-details__left-panel .text-body-medium'
-            ]
-            for selector in headline_selectors:
-                headline_elem = soup.select_one(selector)
-                if headline_elem and headline_elem.text.strip():
-                    basic_info["headline"] = headline_elem.text.strip()
-                    break
+            # Extract headline - use more specific selector
+            headline_elem = soup.select_one('div.text-body-medium')
+            if headline_elem:
+                basic_info["headline"] = headline_elem.text.strip()
             
-            # Extract location
-            location_selectors = [
-                '.pv-text-details__left-panel .text-body-small.inline:not(.visually-hidden)',
-                '.pb2 .text-body-small'
-            ]
-            for selector in location_selectors:
-                location_elems = soup.select(selector)
-                if location_elems:
-                    # Usually the second element is the location
-                    if len(location_elems) > 1:
-                        basic_info["location"] = location_elems[1].text.strip()
-                    else:
-                        basic_info["location"] = location_elems[0].text.strip()
-                    break
+            # Extract location - specific to profile page
+            location_elem = soup.select_one('span.text-body-small.inline.t-black--light.break-words')
+            if location_elem:
+                basic_info["location"] = location_elem.text.strip()
+            
+            # Extract connections
+            connections_elem = soup.select_one('li.text-body-small span.t-black--light')
+            if connections_elem:
+                connections_text = connections_elem.text.strip()
+                # Extract the connections count
+                if "connections" in connections_text:
+                    basic_info["connections"] = connections_text.replace("connections", "").strip()
             
             # Extract about section
-            about_selectors = [
-                '#about ~ .display-flex .pv-shared-text-with-see-more',
-                '.pv-about-section .pv-about__summary-text'
-            ]
-            for selector in about_selectors:
-                about_elem = soup.select_one(selector)
-                if about_elem:
-                    # Clean up the text
-                    about_text = about_elem.get_text(separator=' ', strip=True)
+            about_section = soup.select_one('section#about, div.pv-about-section')
+            if about_section:
+                about_text_elem = about_section.select_one('div.display-flex div.t-14.t-normal.t-black')
+                if about_text_elem:
+                    about_text = about_text_elem.get_text(separator=' ', strip=True)
                     basic_info["about"] = about_text
-                    break
             
-            # Extract followers count
-            followers_selectors = [
-                '.pv-top-card--list .t-black--light:contains("followers")',
-                '.pv-recent-activity-section__follower-count'
-            ]
-            for selector in followers_selectors:
-                followers_elem = soup.select_one(selector)
-                if followers_elem:
-                    followers_text = followers_elem.text.strip()
-                    # Extract number from text
-                    followers_match = re.search(r'([\d,]+)\s+followers', followers_text)
-                    if followers_match:
-                        basic_info["followers"] = followers_match.group(1).replace(',', '')
-                    break
+            # Extract followers count if available
+            followers_elem = soup.select_one('span:contains("followers")')
+            if followers_elem:
+                followers_text = followers_elem.text.strip()
+                followers_match = re.search(r'([\d,]+)\s+followers', followers_text)
+                if followers_match:
+                    basic_info["followers"] = followers_match.group(1).replace(',', '')
             
-            # Extract connections count
-            connections_selectors = [
-                '.pv-top-card--list .t-black--light:contains("connections")',
-                '.pv-top-card__connections'
-            ]
-            for selector in connections_selectors:
-                connections_elem = soup.select_one(selector)
-                if connections_elem:
-                    connections_text = connections_elem.text.strip()
-                    # Extract number from text
-                    connections_match = re.search(r'([\d,]+)\s+connections', connections_text)
-                    if connections_match:
-                        basic_info["connections"] = connections_match.group(1).replace(',', '')
-                    # Check for "500+"
-                    elif "500+" in connections_text:
-                        basic_info["connections"] = "500+"
-                    break
-                    
         except Exception as e:
             logger.error(f"Error parsing basic info: {str(e)}")
+            logger.error(traceback.format_exc())
         
         # Update profile data
         self.profile_data["basic_info"] = basic_info
@@ -242,7 +207,7 @@ class LinkedInProfileParser:
     
     def parse_experience(self) -> List[Dict[str, Any]]:
         """
-        Parse work experience information.
+        Parse work experience information with improved data field mapping.
         
         Returns:
             List of dictionaries containing work experience entries
@@ -257,70 +222,119 @@ class LinkedInProfileParser:
         experiences = []
         
         try:
-            # Look for experience entries
-            experience_sections = soup.select('.pvs-list__item--line-separated, .pv-entity__position-group, .artdeco-list__item')
+            # Look for top-level experience entries
+            experience_items = soup.select('li.pvs-list__paged-list-item')
             
-            for section in experience_sections:
+            for item in experience_items:
                 # Skip if it's just a spacer or doesn't contain relevant info
-                if not section.text.strip() or len(section.text.strip()) < 10:
+                if not item.text.strip() or len(item.text.strip()) < 10:
                     continue
                 
-                experience = {
-                    "title": "",
-                    "company": "",
-                    "location": "",
-                    "description": "",
-                    "date_range": "",
-                    "duration": ""
-                }
+                # Check if this is a grouped experience (multiple positions at same company)
+                grouped_section = item.select_one('div.pvs-list__container')
+                is_grouped = grouped_section is not None
                 
-                # Extract title
-                title_elem = section.select_one('.t-bold span, .t-18 span, .pv-entity__summary-info-header span, .pv-entity__position-group-role-item-title')
-                if title_elem:
-                    experience["title"] = title_elem.text.strip()
-                
-                # Extract company
-                company_elem = section.select_one('.t-normal span, .t-16 span, .pv-entity__secondary-title, .pv-entity__company-summary-info > span:nth-child(2)')
-                if company_elem:
-                    experience["company"] = company_elem.text.strip()
-                
-                # Extract date range and duration
-                date_elem = section.select_one('.t-normal.t-black--light span, .pv-entity__date-range span:nth-child(2)')
-                if date_elem:
-                    experience["date_range"] = date_elem.text.strip()
+                if is_grouped:
+                    # Handle grouped experience (multiple roles at same company)
+                    company_elem = item.select_one('div.mr1.hoverable-link-text.t-bold span')
+                    company_name = company_elem.text.strip() if company_elem else ""
                     
-                    # Try to extract duration
-                    duration_elem = section.select_one('.pv-entity__bullet-item-v2, .date-range__duration')
-                    if duration_elem:
-                        experience["duration"] = duration_elem.text.strip()
-                
-                # Extract location
-                location_elem = section.select_one('.t-normal.t-black--light span:contains("·"), .pv-entity__location span:nth-child(2)')
-                if location_elem:
-                    location_text = location_elem.text.strip()
-                    if location_text and '·' not in location_text:
-                        experience["location"] = location_text
-                
-                # Extract description
-                description_elem = section.select_one('.pv-entity__description, .inline-show-more-text')
-                if description_elem:
-                    experience["description"] = description_elem.get_text(separator=' ', strip=True)
-                
-                # Only add if at least title and company are available
-                if experience["title"] or experience["company"]:
-                    experiences.append(experience)
+                    company_duration_elem = item.select_one('span.t-14.t-normal span')
+                    company_duration = company_duration_elem.text.strip() if company_duration_elem else ""
+                    
+                    # Process each position within the company
+                    position_items = grouped_section.select('li.pvs-list__paged-list-item')
+                    for pos_item in position_items:
+                        position = {
+                            "title": "",
+                            "company": company_name,
+                            "location": "",
+                            "description": "",
+                            "date_range": "",
+                            "duration": company_duration  # Store total duration at company
+                        }
+                        
+                        # Extract position title
+                        pos_title_elem = pos_item.select_one('div.mr1.hoverable-link-text.t-bold span')
+                        if pos_title_elem:
+                            position["title"] = pos_title_elem.text.strip()
+                        
+                        # Extract position date range
+                        date_elements = pos_item.select('span.t-14.t-normal.t-black--light span')
+                        for date_elem in date_elements:
+                            text = date_elem.text.strip()
+                            if "·" in text and any(month in text for month in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]):
+                                position["date_range"] = text
+                                break
+                        
+                        # Extract position location
+                        for location_elem in date_elements:
+                            text = location_elem.text.strip()
+                            if text and "·" not in text and not any(month in text for month in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]):
+                                position["location"] = text
+                                break
+                        
+                        # Extract position description
+                        desc_elem = pos_item.select_one('div.t-14.t-normal.t-black span')
+                        if desc_elem:
+                            position["description"] = desc_elem.get_text(separator=' ', strip=True)
+                        
+                        # Only add if we have a valid title
+                        if position["title"]:
+                            experiences.append(position)
+                else:
+                    # Handle single position
+                    experience = {
+                        "title": "",
+                        "company": "",
+                        "location": "",
+                        "description": "",
+                        "date_range": "",
+                        "duration": ""
+                    }
+                    
+                    # Extract title
+                    title_elem = item.select_one('div.mr1.hoverable-link-text.t-bold span')
+                    if title_elem:
+                        experience["title"] = title_elem.text.strip()
+                    
+                    # Extract company name
+                    company_elem = item.select_one('span.t-14.t-normal span')
+                    if company_elem:
+                        experience["company"] = company_elem.text.strip()
+                    
+                    # Extract date range and location
+                    info_elements = item.select('span.t-14.t-normal.t-black--light span')
+                    for info_elem in info_elements:
+                        text = info_elem.text.strip()
+                        if "·" in text and any(month in text for month in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]):
+                            experience["date_range"] = text
+                        elif text and not text.startswith("·"):
+                            experience["location"] = text
+                    
+                    # Extract description
+                    desc_elem = item.select_one('div.t-14.t-normal.t-black span')
+                    if desc_elem:
+                        experience["description"] = desc_elem.get_text(separator=' ', strip=True)
+                    
+                    # Filter out connection entries and only add valid entries
+                    if (experience["title"] or experience["company"]) and not (
+                        "· 3rd" in experience.get("company", "") or 
+                        "· 2nd" in experience.get("company", "") or
+                        "· 1st" in experience.get("company", "")):
+                        experiences.append(experience)
         
         except Exception as e:
             logger.error(f"Error parsing experience: {str(e)}")
+            logger.error(traceback.format_exc())
         
         # Update profile data
         self.profile_data["experiences"] = experiences
         
         return experiences
-    
     def parse_education(self) -> List[Dict[str, Any]]:
         """
-        Parse education information.
+        Parse education information with improved selectors.
         
         Returns:
             List of dictionaries containing education entries
@@ -335,12 +349,12 @@ class LinkedInProfileParser:
         education_entries = []
         
         try:
-            # Look for education entries
-            education_sections = soup.select('.pvs-list__item--line-separated, .pv-entity__position-group, .artdeco-list__item')
+            # Find all education list items
+            education_items = soup.select('li.pvs-list__paged-list-item')
             
-            for section in education_sections:
+            for item in education_items:
                 # Skip if it's just a spacer or doesn't contain relevant info
-                if not section.text.strip() or len(section.text.strip()) < 10:
+                if not item.text.strip() or len(item.text.strip()) < 10:
                     continue
                 
                 education = {
@@ -352,42 +366,50 @@ class LinkedInProfileParser:
                     "description": ""
                 }
                 
-                # Extract school
-                school_elem = section.select_one('.t-bold span, .pv-entity__school-name')
+                # Extract school name - this is in the bold text
+                school_elem = item.select_one('div.mr1.hoverable-link-text.t-bold span')
                 if school_elem:
                     education["school"] = school_elem.text.strip()
                 
-                # Extract degree
-                degree_elem = section.select_one('.t-normal span, .pv-entity__degree-name span:nth-child(2)')
-                if degree_elem:
-                    education["degree"] = degree_elem.text.strip()
+                # Extract degree - this is in the normal t-14 text
+                degree_elems = item.select('span.t-14.t-normal span')
+                if degree_elems and len(degree_elems) > 0:
+                    education["degree"] = degree_elems[0].text.strip()
                 
-                # Extract field of study
-                field_elem = section.select_one('.pv-entity__fos span:nth-child(2), .field-of-study')
-                if field_elem:
-                    education["field_of_study"] = field_elem.text.strip()
-                
-                # Extract date range
-                date_elem = section.select_one('.t-normal.t-black--light span, .pv-entity__dates span:nth-child(2)')
+                # Extract date range - look for the caption wrapper
+                date_elem = item.select_one('span.pvs-entity__caption-wrapper')
                 if date_elem:
                     education["date_range"] = date_elem.text.strip()
                 
-                # Extract activities
-                activities_elem = section.select_one('.pv-entity__extra-details, .activities-societies')
-                if activities_elem:
-                    education["activities"] = activities_elem.get_text(separator=' ', strip=True)
+                # Look for additional information like activities or description
+                # These may be in sub-components
+                desc_elems = item.select('div.pvs-entity__sub-components li div.t-14.t-normal.t-black span')
+                if desc_elems:
+                    for desc_elem in desc_elems:
+                        text = desc_elem.text.strip()
+                        if text:
+                            if 'activities' in text.lower() or 'club' in text.lower() or 'society' in text.lower():
+                                education["activities"] = text
+                            else:
+                                education["description"] += text + " "
+                    
+                    # Trim any extra whitespace
+                    education["description"] = education["description"].strip()
                 
-                # Extract description
-                description_elem = section.select_one('.pv-entity__description, .education-description')
-                if description_elem:
-                    education["description"] = description_elem.get_text(separator=' ', strip=True)
+                # Extract field of study if it's separate from degree
+                # Sometimes it appears as "Degree, Field of Study"
+                if education["degree"] and "," in education["degree"]:
+                    parts = education["degree"].split(",", 1)
+                    education["degree"] = parts[0].strip()
+                    education["field_of_study"] = parts[1].strip()
                 
                 # Only add if at least school is available
                 if education["school"]:
                     education_entries.append(education)
-        
+            
         except Exception as e:
             logger.error(f"Error parsing education: {str(e)}")
+            logger.error(traceback.format_exc())
         
         # Update profile data
         self.profile_data["education"] = education_entries
